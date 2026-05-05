@@ -55,6 +55,13 @@ def epic_sync_status():
     return jsonify(get_sync_state())
 
 
+@bp.route('/sync/cancel', methods=['POST'])
+def epic_sync_cancel():
+    from .epic import cancel_library_sync
+    cancel_library_sync()
+    return jsonify({'status': 'ok'})
+
+
 @bp.route('/sync-metadata', methods=['POST'])
 def epic_sync_metadata():
     from .epic import start_meta_sync
@@ -113,3 +120,12 @@ def epic_uninstall(appid):
 
     log.info(f"Epic uninstall: {row['name']!r} (appid {appid}): {message}")
     return jsonify({'status': 'success' if ok else 'warning', 'message': message})
+
+
+@bp.route('/import-dates', methods=['POST'])
+def epic_import_dates():
+    from .epic import import_purchase_dates
+    result = import_purchase_dates()
+    if 'error' in result:
+        return jsonify({'status': 'error', 'message': result['error']}), 400
+    return jsonify({'status': 'success', 'updated': result['updated'], 'not_found': result['not_found']})
