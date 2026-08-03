@@ -7,7 +7,7 @@ log = logging.getLogger(__name__)
 
 
 def _find_native_launcher():
-    """Return path to EpicGamesLauncher executable on Windows/Mac, or None."""
+    """Return a truthy path/dir indicating EpicGamesLauncher is installed, or None."""
     if sys.platform == 'win32':
         candidates = []
         for env in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432'):
@@ -22,11 +22,57 @@ def _find_native_launcher():
         for path in candidates:
             if os.path.isfile(path):
                 return path
+        # Check registry for custom install locations
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for sub in (r'SOFTWARE\WOW6432Node\EpicGames\EpicGamesLauncher',
+                            r'SOFTWARE\EpicGames\EpicGamesLauncher'):
+                    try:
+                        key = winreg.OpenKey(root, sub)
+                        app_data, _ = winreg.QueryValueEx(key, 'AppDataPath')
+                        winreg.CloseKey(key)
+                        if app_data and os.path.isdir(app_data):
+                            return app_data
+                    except Exception:
+                        pass
+        except ImportError:
+            pass
+        # Final fallback: ProgramData directory the installer always creates
+        programdata = os.environ.get('PROGRAMDATA', r'C:\ProgramData')
+        epic_dir = os.path.join(programdata, 'Epic', 'EpicGamesLauncher')
+        if os.path.isdir(epic_dir):
+            return epic_dir
     elif sys.platform == 'darwin':
         candidate = '/Applications/Epic Games Launcher.app/Contents/MacOS/EpicGamesLauncher'
         if os.path.isfile(candidate):
             return candidate
     return None
+
+
+def _heal_launcher_manifest(prefix):
+    """
+    Work around a Wine bug in EpicGamesLauncher's self-updater: after an update
+    it should promote LauncherUpdate.manifest -> Launcher.manifest, but the
+    rename silently fails under Wine. With no local manifest, the launcher
+    concludes it's always out of date, "reinstalls" (no-op copy), and restarts
+    itself every few seconds -- a runaway loop that can freeze the machine.
+    Called before every launch so a fresh install or a later real EGL update
+    can't leave the launcher stuck in that state.
+    """
+    data_dir = os.path.join(prefix, 'drive_c', 'ProgramData', 'Epic', 'EpicGamesLauncher', 'Data')
+    manifest = os.path.join(data_dir, 'Launcher.manifest')
+    pending  = os.path.join(data_dir, 'LauncherUpdate.manifest')
+    if os.path.isfile(manifest) or not os.path.isfile(pending):
+        return
+    try:
+        import shutil
+        shutil.copy2(pending, manifest)
+        if os.path.isfile(pending + '.meta'):
+            shutil.copy2(pending + '.meta', manifest + '.meta')
+        log.info('Epic launcher: promoted LauncherUpdate.manifest -> Launcher.manifest to break self-update loop')
+    except Exception as e:
+        log.warning('Epic launcher: failed to promote launcher manifest: %s', e)
 
 
 class EpicGamesPlugin:
@@ -54,6 +100,10 @@ class EpicGamesPlugin:
             install_base = _get_install_base()
             if install_base:
                 start_epic_watcher(install_base)
+
+    def resync_installed(self):
+        from .watcher import sync_epic_install_status
+        sync_epic_install_status()
 
     def on_shutdown(self):
         from .watcher import stop_epic_watcher, stop_periodic_sync
@@ -111,6 +161,7 @@ class EpicGamesPlugin:
                         'status':  'error',
                         'message': 'Epic launcher not configured. Open Plugins → Manage to set up Wine.',
                     }
+                _heal_launcher_manifest(prefix)
                 from runners.wine import launch_protocol_url
                 launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={
                     'WINEDEBUG': '-all',
@@ -237,29 +288,55 @@ class EpicGamesPlugin:
                                     'Click <strong>Open Epic Login</strong> — your browser opens the Epic login page.',
                                     'Log in to your Epic Games account.',
                                     "You'll land on a page showing a code. Copy the value next to <code>authorizationCode</code> and paste it below.",
+                                    'If the popup gets stuck on a verification/captcha page: Epic\'s login is behind '
+                                    'Cloudflare, which sometimes blocks PlayDate\'s embedded browser outright. Sign in at '
+                                    '<a href="https://www.epicgames.com/id/login?redirectUrl=https%3A%2F%2Fwww.epicgames.com%2Fid%2Fapi%2Fredirect%3FclientId%3D34a02cf8f4414e29b15921876da36f9a%26responseType%3Dcode" target="_blank">epicgames.com</a> '
+                                    'in your regular browser instead, copy the authorizationCode from the page you land on, and paste it below.',
                                 ],
                                 'input_placeholder': 'Paste the authorizationCode value',
                                 'open_label': 'Open Epic Login',
                                 'submit_label': 'Connect',
                             }},
+                            {'type': 'button', 'label': 'Paste authorizationCode manually', 'variant': 'muted', 'action': {
+                                'type': 'oauth_paste',
+                                'title': 'Connect Epic Account',
+                                'url_endpoint': '/api/epic_games/auth-url',
+                                'callback_endpoint': '/api/epic_games/callback',
+                                'instructions': [],
+                                'input_placeholder': '',
+                                'open_label': '',
+                                'submit_label': 'Connect',
+                            }},
                         ],
                         'connected': [
                             {'type': 'connected_label'},
-                            {'type': 'buttons', 'items': [
-                                {'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'epicSync'}},
-                                {'label': 'Import Purchase Dates', 'action': {'type': 'call', 'fn': 'epicImportDates'}},
-                                {'label': 'Disconnect', 'variant': 'muted', 'action': {
-                                    'type': 'post', 'endpoint': '/api/epic_games/disconnect',
-                                    'on_success': 'refresh_auth',
-                                }},
-                            ]},
+                            {'type': 'button', 'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'epicSync'}},
+                            {'type': 'button', 'label': 'Import Purchase Dates', 'action': {'type': 'call', 'fn': 'epicImportDates'}},
+                            {'type': 'button', 'label': 'Disconnect', 'variant': 'muted', 'action': {
+                                'type': 'post', 'endpoint': '/api/epic_games/disconnect',
+                                'on_success': 'refresh_auth',
+                            }},
                             {'type': 'status_output', 'key': 'main'},
                         ],
                     },
                 },
                 launcher_section,
+                {
+                    'title': 'Library',
+                    'items': [
+                        {'type': 'text', 'content': 'Fix store page links for games where the URL does not resolve correctly. Does not require an Epic account.'},
+                        {'type': 'button', 'label': 'Fix Store Links', 'action': {
+                            'type': 'call', 'fn': 'epicFixSlugs',
+                        }},
+                    ],
+                },
             ],
         }
+
+    def fetch_purchase_dates(self, appids, on_result):
+        from .epic import fetch_purchase_dates_for_appids
+        for appid, ts in fetch_purchase_dates_for_appids(appids).items():
+            on_result(appid, ts)
 
     def fetch_description(self, appid, platform_id):
         from .epic import fetch_description

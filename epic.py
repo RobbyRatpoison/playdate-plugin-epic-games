@@ -10,7 +10,7 @@ import threading
 import time
 
 import requests
-from config import CONFIG_PATH, BASE_DIR, load_config, _save_config_data
+from config import BASE_DIR, load_config, _save_config_data
 from database import next_negative_appid
 from images import save_as_jpg
 from utils import review_score_label
@@ -75,6 +75,19 @@ _tag_cache_lock = threading.Lock()
 
 VERTICAL_DIR   = os.path.join(BASE_DIR, 'static', 'img', 'library', 'vertical')
 HORIZONTAL_DIR = os.path.join(BASE_DIR, 'static', 'img', 'library', 'horizontal')
+
+
+def _clean_epic_slug(slug):
+    """
+    Epic's catalog/store APIs (urlSlug/productSlug) inconsistently append a
+    sub-page segment like "/home" to some products' slugs and not others --
+    seemingly depending on how the listing was configured on Epic's end, not
+    anything PlayDate can predict. The store_url template only wants the bare
+    product slug (store.epicgames.com/p/{slug}); a "/home" (or any other
+    sub-page) suffix produces a broken link for the affected games.
+    """
+    slug = (slug or '').strip().strip('/')
+    return slug.split('/', 1)[0] if slug else ''
 
 
 # ── Token storage ─────────────────────────────────────────────────────────────
@@ -343,7 +356,7 @@ def _do_sync_library():
                     entry    = catalog_batch.get(cid, {})
                     app_name = cid_best_appname.get(cid, '')
                     name     = entry.get('title') or app_name
-                    url_slug = entry.get('urlSlug', '')
+                    url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
 
                     with _sync_lock:
                         _sync_state['current_game'] = name
@@ -367,7 +380,9 @@ def _do_sync_library():
                     # Metadata from catalog entry + store/ratings API
                     meta = _extract_metadata(entry)
                     if ns not in store_cache:
-                        store_cache[ns] = _fetch_epic_store_data(ns)
+                        s = _fetch_epic_store_data(ns)
+                        s.pop('_description', None)
+                        store_cache[ns] = s
                     if ns not in ratings_cache:
                         ratings_cache[ns] = _fetch_epic_ratings(ns)
                     meta.update(store_cache[ns])
@@ -410,7 +425,8 @@ def _do_sync_library():
         log.warning(f'Epic sync: install status refresh failed: {e}')
 
     from database import auto_detect_duplicates
-    dupes = auto_detect_duplicates()
+    from plugins import get_platform_priority
+    dupes = auto_detect_duplicates(platform_priority=get_platform_priority())
 
     if new_games_count > 0:
         try:
@@ -519,7 +535,7 @@ def _fetch_epic_store_data(namespace):
             if names:
                 result['tags'] = ','.join(names)
                 log.info(f'Epic store tags for {namespace!r}: {names}')
-        slug = (el.get('productSlug') or el.get('urlSlug') or '').strip()
+        slug = _clean_epic_slug(el.get('productSlug') or el.get('urlSlug'))
         if slug:
             result['platform_slug'] = slug
         desc = (el.get('description') or '').strip()
@@ -608,7 +624,7 @@ def _extract_metadata(entry):
         # Epic stores as "Action,Adventure" -- matches our comma-separated convention
         meta['genres'] = genres_str
 
-    url_slug = entry.get('urlSlug', '').strip()
+    url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
     if url_slug:
         meta['platform_slug'] = url_slug
 
@@ -670,10 +686,15 @@ def scrape_single(appid):
     """
     Re-fetch metadata and art for a single Epic game.
     Returns a dict of updated fields, or None on failure.
+    Raises RuntimeError when not connected or the session has expired, so
+    the route can tell that apart from a genuine fetch failure instead of
+    reporting both as the same generic error.
     """
+    if not is_connected():
+        raise RuntimeError('Epic Games account not connected')
     session = get_valid_session()
     if not session:
-        return None
+        raise RuntimeError('Epic Games session expired — please reconnect')
 
     from database import get_db
     db  = get_db()
@@ -690,10 +711,13 @@ def scrape_single(appid):
         return None
 
     from datetime import date
-    ns   = row['platform_ns']
-    meta = _extract_metadata(entry)
-    meta['meta_fetched'] = date.today().isoformat()
-    meta.update(_fetch_epic_store_data(ns))
+    ns    = row['platform_ns']
+    today = date.today().isoformat()
+    meta  = _extract_metadata(entry)
+    meta['meta_fetched'] = today
+    store = _fetch_epic_store_data(ns)
+    store.pop('_description', None)
+    meta.update(store)
     meta.update(_fetch_epic_ratings(ns))
 
     # Re-fetch art if files are missing
@@ -740,41 +764,33 @@ def start_meta_sync(force=False):
     return {'status': 'started'}
 
 
-def import_purchase_dates():
+def _fetch_entitlement_date_maps():
     """
-    Fetch Epic entitlements and update date_added for all matched library games.
-    Returns {'updated': int, 'not_found': int} or {'error': str}.
+    Fetch all Epic entitlements and return (ns_date_map, cid_date_map).
+    Raises RuntimeError on auth failure or unexpected response.
     """
-    from database import get_db, update_game_data
     from datetime import datetime
 
     tokens = load_epic_tokens()
     if not tokens:
-        return {'error': 'Epic account not connected'}
-
+        raise RuntimeError('Epic account not connected')
     account_id = tokens.get('account_id', '')
     if not account_id:
-        return {'error': 'No account ID stored'}
-
+        raise RuntimeError('No Epic account ID stored')
     session = get_valid_session()
     if not session:
-        return {'error': 'Could not refresh Epic token'}
+        raise RuntimeError('Could not refresh Epic token')
 
-    try:
-        r = session.get(
-            f'https://entitlement-public-service-prod08.ol.epicgames.com'
-            f'/entitlement/api/account/{account_id}/entitlements',
-            params={'count': 5000},
-            timeout=30,
-        )
-        r.raise_for_status()
-        entitlements = r.json()
-    except Exception as e:
-        log.warning(f'Epic import-dates: entitlements fetch failed: {e}')
-        return {'error': f'Failed to fetch entitlements: {e}'}
-
+    r = session.get(
+        f'https://entitlement-public-service-prod08.ol.epicgames.com'
+        f'/entitlement/api/account/{account_id}/entitlements',
+        params={'count': 5000},
+        timeout=30,
+    )
+    r.raise_for_status()
+    entitlements = r.json()
     if not isinstance(entitlements, list):
-        return {'error': 'Unexpected entitlements response format'}
+        raise RuntimeError('Unexpected entitlements response format')
 
     log.info(f'Epic import-dates: {len(entitlements)} entitlements received')
 
@@ -800,6 +816,22 @@ def import_purchase_dates():
             if cid not in cid_date_map or ts < cid_date_map[cid]:
                 cid_date_map[cid] = ts
 
+    return ns_date_map, cid_date_map
+
+
+def import_purchase_dates():
+    """
+    Fetch Epic entitlements and update date_added for all matched library games.
+    Returns {'updated': int, 'not_found': int} or {'error': str}.
+    """
+    from database import get_db, update_game_data
+
+    try:
+        ns_date_map, cid_date_map = _fetch_entitlement_date_maps()
+    except Exception as e:
+        log.warning(f'Epic import-dates: {e}')
+        return {'error': str(e)}
+
     db   = get_db()
     rows = db.execute(
         "SELECT appid, platform_id, platform_ns FROM games WHERE platform = 'epic_games'"
@@ -822,8 +854,37 @@ def import_purchase_dates():
         except Exception as e:
             log.warning(f'Epic import-dates: DB update failed for {platform_id}: {e}')
 
-    log.info(f'Epic import-dates: {updated} updated, {not_found} not in library')
+    log.info(f'Epic import-dates: {updated} updated, {not_found} not in library | '
+             f'debug={{"entitlement_count": {len(ns_date_map)+len(cid_date_map)}, '
+             f'"db_epic_count": {len(rows)}, '
+             f'"entitlement_sample": {list(cid_date_map.keys())[:10]}}}')
     return {'updated': updated, 'not_found': not_found}
+
+
+def fetch_purchase_dates_for_appids(appids):
+    """
+    Return {appid: unix_ts_or_None} for the given Epic appids without updating the DB.
+    Raises RuntimeError on auth/API failure.
+    """
+    from database import get_db
+
+    ns_date_map, cid_date_map = _fetch_entitlement_date_maps()
+
+    db   = get_db()
+    ph   = ','.join('?' * len(appids))
+    rows = db.execute(
+        f'SELECT appid, platform_id, platform_ns FROM games WHERE appid IN ({ph})', appids
+    ).fetchall()
+    db.close()
+
+    result = {}
+    for row in rows:
+        ts = (cid_date_map.get(row['platform_id'] or '')
+              or ns_date_map.get(row['platform_ns'] or ''))
+        result[row['appid']] = ts
+    for appid in appids:
+        result.setdefault(appid, None)
+    return result
 
 
 def _sync_metadata(force=False):
@@ -877,7 +938,9 @@ def _sync_metadata(force=False):
             else:
                 meta = _extract_metadata(entry)
                 meta['meta_fetched'] = today
-                meta.update(_fetch_epic_store_data(platform_ns))
+                store = _fetch_epic_store_data(platform_ns)
+                store.pop('_description', None)
+                meta.update(store)
                 meta.update(_fetch_epic_ratings(platform_ns))
 
                 try:
