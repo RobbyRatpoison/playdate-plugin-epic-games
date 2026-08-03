@@ -1,7 +1,7 @@
 {
     "id": "epic_games",
     "name": "Epic Games",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "platform": "epic_games",
     "author": "RobbyRatpoison",
     "source": "github:RobbyRatpoison/playdate-plugin-epic-games",
@@ -18,5 +18,10 @@
                 "lib/vkd3d/x86_64-windows/libvkd3d-shader-1.dll"
             ]
         }
+    },
+    "platform_status": {
+        "windows": "untested",
+        "linux": "working",
+        "mac": "untested"
     }
 }
