@@ -75,6 +75,54 @@ def _heal_launcher_manifest(prefix):
         log.warning('Epic launcher: failed to promote launcher manifest: %s', e)
 
 
+def _heal_pending_self_update(prefix, wine_bin=None):
+    """
+    Work around a Wine bug that leaves EpicGamesLauncher's self-update
+    permanently stuck: when a newer version exists, the launcher downloads
+    and stages it under Data/Update/Install, then tries to apply it via
+    `EpicGamesLauncher.exe -Commandlet=selfupdateinstall -RanAsService`,
+    dispatched through Wine's services.exe. That commandlet touches Slate/
+    DXGI -- GUI-adjacent init that expects a desktop -- but a Wine "service"
+    process has no desktop session, so it dies almost instantly
+    (StartServiceFailed, exit 777006) without installing anything or
+    relaunching the launcher: the window just closes and nothing happens.
+    Confirmed by hand: running the identical commandlet as a normal
+    (non-service) process completes correctly and the launcher then reports
+    itself up to date on the next launch. Called before every launch,
+    mirroring _heal_launcher_manifest -- a no-op unless a staged update is
+    actually sitting there unapplied.
+    """
+    live = os.path.join(prefix, 'drive_c', 'Program Files', 'Epic Games', 'Launcher',
+                         'Portal', 'Binaries', 'Win64', 'EpicGamesLauncher.exe')
+    staged = os.path.join(prefix, 'drive_c', 'ProgramData', 'Epic', 'EpicGamesLauncher',
+                           'Data', 'Update', 'Install', 'Portal', 'Binaries', 'Win64', 'EpicGamesLauncher.exe')
+    if not os.path.isfile(staged) or not os.path.isfile(live):
+        return
+    if os.path.getmtime(staged) <= os.path.getmtime(live):
+        return
+
+    from runners.wine import find_wine_binary, is_proton_wine, build_proton_env
+    from runners.sandbox import host_run
+    if wine_bin is None:
+        wine_bin = find_wine_binary()
+    if not wine_bin:
+        return
+
+    env = build_proton_env(wine_bin) if is_proton_wine(wine_bin) else dict(os.environ)
+    env['WINEPREFIX'] = prefix
+    env['WINEDEBUG'] = '-all'
+
+    try:
+        result = host_run(
+            [wine_bin, r'C:\Program Files\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe',
+             '-Commandlet=selfupdateinstall', '-epicenv=Prod', '-launcherlabel=Live-Krampus', '-ForcedRestart'],
+            env=env, capture_output=True, timeout=90,
+        )
+        log.info('Epic launcher: applied pending self-update directly (exit %s)', result.returncode)
+    except Exception as e:
+        log.warning('Epic launcher: failed to apply pending self-update: %s', e)
+
+
 class EpicGamesPlugin:
     id       = 'epic_games'
     name     = 'Epic Games'
@@ -162,6 +210,7 @@ class EpicGamesPlugin:
                         'message': 'Epic launcher not configured. Open Plugins → Manage to set up Wine.',
                     }
                 _heal_launcher_manifest(prefix)
+                _heal_pending_self_update(prefix, wine_bin)
                 from runners.wine import launch_protocol_url
                 launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={
                     'WINEDEBUG': '-all',

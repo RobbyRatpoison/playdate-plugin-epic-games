@@ -1,7 +1,7 @@
 {
     "id": "epic_games",
     "name": "Epic Games",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "platform": "epic_games",
     "author": "RobbyRatpoison",
     "source": "github:RobbyRatpoison/playdate-plugin-epic-games",
