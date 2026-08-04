@@ -6,6 +6,7 @@ Handles OAuth2 authentication, library sync, metadata, and cover art.
 import json
 import logging
 import os
+import re
 import threading
 import time
 
@@ -229,6 +230,32 @@ def cancel_library_sync():
     _sync_cancel.set()
 
 
+# Bonus content (soundtracks, artbooks) that publishers sometimes ship as their
+# own top-level catalog item with neither `mainGameItem` nor an
+# addons/digitalextras category set -- confirmed live against Q.U.B.E. 2's
+# bundled soundtrack, which the catalog API tags identically to a real game.
+_BONUS_CONTENT_RE = re.compile(r'\b(soundtrack|art\s*book|ost)\b', re.I)
+
+
+def _is_dlc_or_extra(entry, name):
+    """
+    True if a catalog entry is DLC/an add-on/digital-extra rather than a
+    standalone game, and should be skipped during library sync.
+    Epic marks formal DLC via `mainGameItem` (requires requesting the catalog
+    batch with includeMainGameDetails=true) and/or an 'addons'/'digitalextras'
+    category path; neither catches every case (see _BONUS_CONTENT_RE above),
+    so a conservative name-based fallback covers the rest.
+    """
+    if entry.get('mainGameItem'):
+        return True
+    cats = {c.get('path') for c in entry.get('categories', [])}
+    if cats & {'addons', 'digitalextras'}:
+        return True
+    if _BONUS_CONTENT_RE.search(name or ''):
+        return True
+    return False
+
+
 def _run_sync_library():
     try:
         _do_sync_library()
@@ -337,7 +364,8 @@ def _do_sync_library():
 
                 batch = cids[i:i + 50]
                 params = [('id', cid) for cid in batch]
-                params += [('country', 'US'), ('locale', 'en'), ('includeDLCDetails', 'false')]
+                params += [('country', 'US'), ('locale', 'en'),
+                           ('includeDLCDetails', 'true'), ('includeMainGameDetails', 'true')]
                 catalog_batch = {}
                 try:
                     r = session.get(url, params=params, timeout=20)
@@ -356,6 +384,11 @@ def _do_sync_library():
                     entry    = catalog_batch.get(cid, {})
                     app_name = cid_best_appname.get(cid, '')
                     name     = entry.get('title') or app_name
+
+                    if _is_dlc_or_extra(entry, name):
+                        log.info(f'Epic sync: skipping {name!r} (DLC/digital extra, not a standalone game)')
+                        continue
+
                     url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
 
                     with _sync_lock:
