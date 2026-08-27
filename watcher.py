@@ -22,7 +22,13 @@ _MANIFEST_DIR_MAC = os.path.expanduser(
     '~/Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests'
 )
 
-_POLL_INTERVAL = 15  # seconds between periodic install-status syncs
+# Native Windows/Mac has no directory watcher wired up (PluginInstallWatcher
+# only reacts to directory create/delete/move, and native installs are
+# tracked via .item *files* in the manifest dir, not subdirectories) --
+# unverified platforms (no Mac available, see project memory), so this stays
+# on periodic polling rather than risk an unverifiable behavior change.
+# Linux (Wine) uses the instant _watcher below instead, same as EA/Ubisoft.
+_POLL_INTERVAL = 15
 _poll_timer = None
 _poll_lock  = threading.Lock()
 
@@ -204,14 +210,60 @@ def _remove_from_launcher_installed(platform_appname):
         log.warning(f'Epic uninstall: could not update LauncherInstalled.dat: {e}')
 
 
+def _get_eos_installed_items_dir():
+    """Return the path to EOS InstallHelper's InstalledItems dir, or None.
+
+    This is a THIRD, independent install-tracking store on top of the
+    per-game .item manifest and LauncherInstalled.dat -- confirmed live
+    that neither of those being cleared was enough for the launcher to
+    stop considering a game installed. Each installed game gets its own
+    <installationId>.egi JSON file here (installationId == the .item
+    manifest's own filename stem, confirmed matching for real installs)
+    carrying its own independent "state": "Installed" field, which is
+    what was still telling the launcher the game was there."""
+    if sys.platform == 'win32':
+        return os.path.join(os.environ.get('PROGRAMDATA', r'C:\ProgramData'),
+                            'Epic', 'EpicOnlineServices', 'InstallHelper', 'InstalledItems')
+    if sys.platform == 'darwin':
+        return os.path.expanduser(
+            '~/Library/Application Support/Epic/EpicOnlineServices/InstallHelper/InstalledItems')
+    prefix = _get_wine_prefix()
+    if prefix:
+        return os.path.join(prefix, 'drive_c', 'ProgramData', 'Epic',
+                            'EpicOnlineServices', 'InstallHelper', 'InstalledItems')
+    return None
+
+
+def _remove_eos_install_record(installation_id):
+    """Delete <installation_id>.egi from EOS InstallHelper's InstalledItems dir, if present."""
+    items_dir = _get_eos_installed_items_dir()
+    if not items_dir:
+        return
+    egi_path = os.path.join(items_dir, f'{installation_id}.egi')
+    if not os.path.isfile(egi_path):
+        return
+    try:
+        os.remove(egi_path)
+        log.info(f'Epic uninstall: removed EOS install record {egi_path!r}')
+    except Exception as e:
+        log.warning(f'Epic uninstall: could not remove EOS install record: {e}')
+
+
 def uninstall_game_files(platform_appname):
     """
-    Delete the game's install directory, manifest file, and LauncherInstalled.dat entry.
+    Delete the game's install directory, manifest file, LauncherInstalled.dat
+    entry, and EOS InstallHelper install record (see _remove_eos_install_record
+    -- clearing the first two alone was confirmed live to NOT be enough for
+    the launcher to stop considering the game installed).
     Returns (ok: bool, message: str).
     """
     manifest_path, manifest_data = find_manifest_for_game(platform_appname)
 
     if manifest_data:
+        # installationId (EOS's own key) is exactly the .item manifest's own
+        # filename stem -- confirmed matching for real installs.
+        installation_id = os.path.splitext(os.path.basename(manifest_path))[0]
+
         raw_loc = manifest_data.get('InstallLocation', '')
         # Convert Windows path to host path when running under Wine
         if raw_loc and not os.path.isabs(raw_loc):
@@ -239,6 +291,7 @@ def uninstall_game_files(platform_appname):
             log.warning(f'Epic uninstall: could not remove manifest: {e}')
 
         _remove_from_launcher_installed(platform_appname)
+        _remove_eos_install_record(installation_id)
         if not dir_ok:
             return False, 'Game files could not be deleted — the Epic Launcher may be holding them open, or administrator rights may be required'
         return True, 'Uninstalled'
@@ -260,8 +313,6 @@ def uninstall_game_files(platform_appname):
         return False, 'Game files not found — may already be uninstalled'
 
 
-# ── Periodic polling ──────────────────────────────────────────────────────────
-
 def _schedule_poll():
     global _poll_timer
     with _poll_lock:
@@ -279,7 +330,7 @@ def _poll_tick():
 
 
 def start_periodic_sync():
-    """Start the periodic install-status polling loop."""
+    """Native Windows/Mac only -- see module-level comment above _POLL_INTERVAL."""
     _schedule_poll()
     log.info(f'Epic install status polling started (every {_POLL_INTERVAL}s)')
 

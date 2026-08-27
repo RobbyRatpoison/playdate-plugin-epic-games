@@ -50,6 +50,32 @@ def _find_native_launcher():
     return None
 
 
+def _get_launcher_prefix_and_wine():
+    """Return (prefix, wine_bin) from the saved Epic launcher config.
+    prefix is None if unset; wine_bin is None if unset."""
+    import json
+    from config import CONFIG_PATH
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            cfg = json.load(f)
+    except Exception:
+        return None, None
+    lc = cfg.get('launchers', {}).get('epic_games', {})
+    prefix = (lc.get('prefix') or '').strip()
+    wine_bin = (lc.get('wine_bin') or '').strip() or None
+    return (prefix or None), wine_bin
+
+
+def _heal_launcher_loop(prefix, wine_bin=None):
+    """Run both launcher-loop workarounds in order. No-op unless a stale
+    manifest / staged self-update is actually sitting in the prefix."""
+    try:
+        _heal_launcher_manifest(prefix)
+        _heal_pending_self_update(prefix, wine_bin)
+    except Exception as e:
+        log.warning('Epic launcher heal failed: %s', e)
+
+
 def _heal_launcher_manifest(prefix):
     """
     Work around a Wine bug in EpicGamesLauncher's self-updater: after an update
@@ -142,12 +168,32 @@ class EpicGamesPlugin:
             log.info('Epic install status synced on startup')
         except Exception as e:
             log.warning(f'Startup Epic install sync failed: {e}')
-        start_periodic_sync()
-        # File watcher only needed on Linux (Wine prefix); native platforms handle their own events
-        if sys.platform not in ('win32', 'darwin'):
+        if sys.platform in ('win32', 'darwin'):
+            # No directory watcher on native platforms -- see watcher.py's
+            # _POLL_INTERVAL comment.
+            start_periodic_sync()
+        else:
             install_base = _get_install_base()
             if install_base:
                 start_epic_watcher(install_base)
+            # Heal a staged launcher self-update Wine's services.exe can't
+            # apply -- otherwise EGL loops restarting on its next start. Runs
+            # every startup, not just after install or on game launch, so an
+            # already-installed launcher that never had a game launched still
+            # gets fixed. No-op unless something is actually staged.
+            prefix, wine_bin = _get_launcher_prefix_and_wine()
+            if prefix and os.path.isdir(prefix):
+                _heal_launcher_loop(prefix, wine_bin)
+
+    def on_launcher_installed(self, prefix, wine_bin):
+        """Called by the generic launcher installer right after EGL is
+        installed into `prefix`. The EpicInstaller MSI ships one launcher
+        build then stages a newer one; Wine's services.exe can't apply that
+        staged update (no desktop session), so a fresh install would loop
+        restarting on first run. Apply it now instead."""
+        if sys.platform in ('win32', 'darwin'):
+            return
+        _heal_launcher_loop(prefix, wine_bin)
 
     def resync_installed(self):
         from .watcher import sync_epic_install_status
@@ -209,8 +255,7 @@ class EpicGamesPlugin:
                         'status':  'error',
                         'message': 'Epic launcher not configured. Open Plugins → Manage to set up Wine.',
                     }
-                _heal_launcher_manifest(prefix)
-                _heal_pending_self_update(prefix, wine_bin)
+                _heal_launcher_loop(prefix, wine_bin)
                 from runners.wine import launch_protocol_url
                 launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={
                     'WINEDEBUG': '-all',
