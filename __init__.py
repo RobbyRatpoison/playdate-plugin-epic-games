@@ -199,6 +199,10 @@ class EpicGamesPlugin:
         from .watcher import sync_epic_install_status
         sync_epic_install_status()
 
+    def scan_junk(self):
+        from .epic import scan_junk
+        return scan_junk()
+
     def on_shutdown(self):
         from .watcher import stop_epic_watcher, stop_periodic_sync
         stop_periodic_sync()

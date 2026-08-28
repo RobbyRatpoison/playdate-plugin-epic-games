@@ -236,20 +236,34 @@ def cancel_library_sync():
 # bundled soundtrack, which the catalog API tags identically to a real game.
 _BONUS_CONTENT_RE = re.compile(r'\b(soundtrack|art\s*book|ost)\b', re.I)
 
+# Dev-tool / editor entries. Epic files these under the 'engines' category, but
+# so is at least one actual game (Bus Simulator 18), so 'engines' alone isn't
+# enough -- pair it with a name match. 'ARK ModKit (UE4)', 'Conan Exiles Dev Kit'.
+_DEVKIT_RE = re.compile(r'\b(dev\s?kit|mod\s?kit|sdk|editor)\b', re.I)
+
+# Catalog category paths that are never a standalone game. 'software' covers the
+# non-game apps Epic gives away (Brave, itch.io, iHeart, and game-making tools
+# like RPG in a Box); 'addons'/'digitalextras' are DLC / soundtracks / artbooks.
+_NON_GAME_CATEGORIES = {'addons', 'digitalextras', 'software'}
+
 
 def _is_dlc_or_extra(entry, name):
     """
-    True if a catalog entry is DLC/an add-on/digital-extra rather than a
-    standalone game, and should be skipped during library sync.
+    True if a catalog entry is DLC, a digital extra, a non-game application, or a
+    dev kit rather than a standalone game -- skip it during library sync.
+
     Epic marks formal DLC via `mainGameItem` (requires requesting the catalog
     batch with includeMainGameDetails=true) and/or an 'addons'/'digitalextras'
-    category path; neither catches every case (see _BONUS_CONTENT_RE above),
-    so a conservative name-based fallback covers the rest.
+    category; standalone non-games (browsers, media apps, tools) sit under
+    'software'; dev kits under 'engines' + a kit/editor name. A conservative
+    name check (see _BONUS_CONTENT_RE) covers bonus content that slips through.
     """
     if entry.get('mainGameItem'):
         return True
     cats = {c.get('path') for c in entry.get('categories', [])}
-    if cats & {'addons', 'digitalextras'}:
+    if cats & _NON_GAME_CATEGORIES:
+        return True
+    if 'engines' in cats and _DEVKIT_RE.search(name or ''):
         return True
     if _BONUS_CONTENT_RE.search(name or ''):
         return True
@@ -386,7 +400,7 @@ def _do_sync_library():
                     name     = entry.get('title') or app_name
 
                     if _is_dlc_or_extra(entry, name):
-                        log.info(f'Epic sync: skipping {name!r} (DLC/digital extra, not a standalone game)')
+                        log.info(f'Epic sync: skipping {name!r} (DLC / digital extra / non-game app, not a standalone game)')
                         continue
 
                     url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
@@ -713,6 +727,68 @@ def _fetch_catalog_entry(session, platform_id, namespace):
     except Exception as e:
         log.warning(f'Epic catalog fetch failed for {platform_id}: {e}')
     return None
+
+
+def scan_junk():
+    """Re-check every imported Epic game against the catalog with the current
+    _is_dlc_or_extra() filter. Returns [{appid, name, reason}] for the ones that
+    now look like DLC / digital extras / non-game apps -- untouched rows only.
+    Used by the Blacklist Manager's deep junk scan. [] if not connected."""
+    session = get_valid_session()
+    if not session:
+        return []
+
+    from database import get_db
+    db = get_db()
+    rows = db.execute(
+        "SELECT appid, name, platform_id, platform_ns FROM games "
+        "WHERE platform='epic_games' AND platform_id IS NOT NULL "
+        "AND COALESCE(playtime_forever,0)=0 AND COALESCE(installed,0)=0 "
+        "AND COALESCE(completion_status,'Never Played')='Never Played' "
+        "AND (duplicate_of IS NULL OR duplicate_auto=1)"
+    ).fetchall()
+    db.close()
+
+    by_ns = {}
+    for r in rows:
+        by_ns.setdefault(r['platform_ns'] or '', []).append(r)
+
+    out = []
+    for ns, group in by_ns.items():
+        if not ns:
+            continue
+        cids = [r['platform_id'] for r in group]
+        entries = {}
+        for i in range(0, len(cids), 50):
+            url    = _CATALOG_URL_TMPL.format(ns=ns)
+            params = [('id', c) for c in cids[i:i + 50]]
+            params += [('country', 'US'), ('locale', 'en'), ('includeMainGameDetails', 'true')]
+            try:
+                resp = session.get(url, params=params, timeout=25)
+                if resp.status_code == 200:
+                    entries.update(resp.json())
+            except Exception as e:
+                log.warning(f'Epic scan_junk catalog fetch [{ns}]: {e}')
+            time.sleep(0.1)
+        for r in group:
+            e = entries.get(r['platform_id'])
+            if not e:
+                continue
+            name = e.get('title') or r['name']
+            if _is_dlc_or_extra(e, name):
+                cats = {c.get('path') for c in e.get('categories', [])}
+                if e.get('mainGameItem') or (cats & {'addons'}):
+                    reason = 'DLC / add-on'
+                elif 'digitalextras' in cats:
+                    reason = 'digital extra (soundtrack / artbook)'
+                elif 'software' in cats:
+                    reason = 'application, not a game'
+                elif 'engines' in cats:
+                    reason = 'dev kit'
+                else:
+                    reason = 'not a standalone game'
+                out.append({'appid': r['appid'], 'name': r['name'], 'reason': reason})
+    return out
 
 
 def scrape_single(appid):
