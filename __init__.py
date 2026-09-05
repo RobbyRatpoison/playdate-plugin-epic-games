@@ -22,7 +22,16 @@ def _find_native_launcher():
         for path in candidates:
             if os.path.isfile(path):
                 return path
-        # Check registry for custom install locations
+        # Check the Windows Uninstall registry entry -- catches a custom
+        # install directory the two path guesses above miss entirely.
+        from runners.windows import find_installed_exe
+        exe = find_installed_exe('Epic Games Launcher', [
+            os.path.join('Launcher', 'Portal', 'Binaries', 'Win64', 'EpicGamesLauncher.exe'),
+            os.path.join('Launcher', 'Portal', 'Binaries', 'Win32', 'EpicGamesLauncher.exe'),
+        ])
+        if exe:
+            return exe
+        # Check Epic's own registry key for custom install locations
         try:
             import winreg
             for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
@@ -278,6 +287,34 @@ class EpicGamesPlugin:
 
         return {'status': 'success'}
 
+    def start_launcher(self):
+        """Open Epic Games Launcher with no specific game."""
+        url = 'com.epicgames.launcher://'
+        try:
+            if sys.platform == 'win32':
+                os.startfile(url)
+            elif sys.platform == 'darwin':
+                import subprocess
+                subprocess.Popen(['open', url])
+            else:  # Linux / Wine
+                prefix, wine_bin = _get_launcher_prefix_and_wine()
+                if not prefix:
+                    return {
+                        'status':  'error',
+                        'message': 'Epic launcher not configured. Open Plugins → Manage to set up Wine.',
+                    }
+                _heal_launcher_loop(prefix, wine_bin)
+                from runners.wine import launch_protocol_url
+                launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={
+                    'WINEDEBUG': '-all',
+                    'WINEDLLOVERRIDES': 'winegstreamer=',
+                })
+        except RuntimeError as e:
+            return {'status': 'error', 'message': str(e)}
+        except Exception as e:
+            return {'status': 'error', 'message': f'Launch failed: {e}'}
+        return {'status': 'success'}
+
     def launcher_status(self):
         import json
         from config import CONFIG_PATH
@@ -346,6 +383,9 @@ class EpicGamesPlugin:
                 'title': 'Launcher',
                 'items': [
                     {'type': 'text', 'content': 'Epic Games Launcher is installed — no additional setup needed.'},
+                    {'type': 'button', 'label': 'Start Launcher', 'action': {
+                        'type': 'call', 'fn': 'epicStartLauncher',
+                    }},
                 ],
             }
         elif sys.platform in ('win32', 'darwin'):
@@ -359,13 +399,25 @@ class EpicGamesPlugin:
                 ],
             }
         else:
-            launcher_section = {
-                'title': 'Launcher',
-                'items': [
-                    {'type': 'text', 'content': 'Set the Wine binary and prefix where Epic Games Launcher is installed.'},
-                    {'type': 'launcher_config'},
-                ],
-            }
+            items = [
+                {'type': 'text', 'content': 'Set the Wine binary and prefix where Epic Games Launcher is installed.'},
+                {'type': 'launcher_config'},
+            ]
+            _prefix, _wine_bin = _get_launcher_prefix_and_wine()
+            if _prefix and os.path.isdir(_prefix):
+                for _dirpath, _dirs, _files in os.walk(_prefix):
+                    if 'EpicGamesLauncher.exe' in _files:
+                        items.append({'type': 'text', 'content':
+                                      'Epic Games Launcher is installed.'})
+                        items.append({'type': 'button', 'label': 'Start Launcher', 'action': {
+                            'type': 'call', 'fn': 'epicStartLauncher',
+                        }})
+                        items.append({'type': 'button', 'label': 'Open Folder', 'action': {
+                            'type': 'call', 'fn': 'epicOpenFolder',
+                        }})
+                        items.append({'type': 'status_output', 'key': 'folder'})
+                        break
+            launcher_section = {'title': 'Launcher', 'items': items}
 
         return {
             'sections': [

@@ -147,6 +147,31 @@ if (typeof _manageOnOpen !== 'undefined') {
     (_manageOnOpen['epic_games'] = _manageOnOpen['epic_games'] || []).push(_epicResumePolling);
 }
 
+async function epicStartLauncher() {
+    const btn = document.querySelector('button[onclick="epicStartLauncher()"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    try {
+        const r = await fetch('/api/epic_games/start-launcher', { method: 'POST' });
+        const d = await r.json();
+        if (btn) btn.textContent = d.status === 'success' ? 'Started' : (d.message || 'Failed');
+    } catch (e) {
+        if (btn) btn.textContent = 'Failed';
+    } finally {
+        setTimeout(() => { if (btn) { btn.disabled = false; btn.textContent = 'Start Launcher'; } }, 3000);
+    }
+}
+
+async function epicOpenFolder() {
+    const st = document.getElementById('epic_games-manage-status-folder');
+    try {
+        const r = await fetch('/api/epic_games/open-folder', { method: 'POST' });
+        const d = await r.json();
+        if (d.status !== 'ok' && st) st.textContent = d.message || 'Failed to open folder';
+    } catch (e) {
+        if (st) st.textContent = 'Network error';
+    }
+}
+
 async function epicFixSlugs() {
     const btn = document.querySelector('button[onclick="epicFixSlugs()"]');
     if (btn) { btn.disabled = true; btn.textContent = 'Fixing...'; }

@@ -147,6 +147,23 @@ def epic_uninstall(appid):
     return jsonify({'status': 'success' if ok else 'warning', 'message': message})
 
 
+@bp.route('/start-launcher', methods=['POST'])
+def epic_start_launcher():
+    from . import plugin
+    return jsonify(plugin.start_launcher())
+
+
+@bp.route('/open-folder', methods=['POST'])
+def epic_open_folder():
+    from .watcher import _get_wine_install_base
+    from runners.installdir import open_folder
+    install_base = _get_wine_install_base()
+    if not install_base:
+        return jsonify({'status': 'error', 'message': 'No Wine prefix configured'}), 400
+    open_folder(install_base)
+    return jsonify({'status': 'ok'})
+
+
 @bp.route('/import-dates', methods=['POST'])
 def epic_import_dates():
     from .epic import import_purchase_dates
