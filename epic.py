@@ -693,6 +693,37 @@ def _extract_metadata(entry):
     return meta
 
 
+_ART_KEY_TYPES = {'vertical': 'DieselGameBoxTall', 'horizontal': 'DieselGameBox'}
+
+
+def art_urls(appid):
+    """Where Epic's own artwork for this game lives, for core's Artwork Sources
+    "Store" option: {'vertical': url, 'horizontal': url} from the catalog
+    keyImages ({} if not connected, no catalog entry, or nothing usable).
+    Core does the download and JPEG conversion; Epic has no icon art."""
+    if not is_connected():
+        return {}
+    session = get_valid_session()
+    if not session:
+        return {}
+    from database import get_db
+    db  = get_db()
+    row = db.execute(
+        "SELECT platform_id, platform_ns FROM games WHERE appid = ? AND platform = 'epic_games'",
+        (appid,)
+    ).fetchone()
+    db.close()
+    if not row or not row['platform_id'] or not row['platform_ns']:
+        return {}
+    entry = _fetch_catalog_entry(session, row['platform_id'], row['platform_ns'])
+    urls = {}
+    for img in (entry or {}).get('keyImages', []):
+        for kind, img_type in _ART_KEY_TYPES.items():
+            if img.get('type') == img_type and img.get('url') and kind not in urls:
+                urls[kind] = img['url']
+    return urls
+
+
 def _download_epic_art(appid, key_images):
     """Download vertical and horizontal art from Epic keyImages list."""
     type_map = {

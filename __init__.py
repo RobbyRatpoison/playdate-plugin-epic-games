@@ -496,6 +496,12 @@ class EpicGamesPlugin:
         from .epic import scrape_single
         return scrape_single(appid) or None
 
+    art_kinds = ('vertical', 'horizontal')   # Epic has no icon art
+
+    def art_urls(self, appid):
+        from .epic import art_urls
+        return art_urls(appid)
+
     def fragments(self):
         return {
             'base_head_styles': 'epic_games_base_head_styles.html',
