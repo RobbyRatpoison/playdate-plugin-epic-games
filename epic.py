@@ -54,7 +54,11 @@ _SEARCH_STORE_QUERY = """
 query searchStoreQuery($namespace: String, $country: String!, $locale: String) {
   Catalog {
     searchStore(namespace: $namespace, country: $country, locale: $locale) {
-      elements { productSlug urlSlug description tags { id } }
+      elements {
+        productSlug urlSlug description tags { id } pcReleaseDate
+        offerMappings { pageSlug pageType }
+        catalogNs { mappings(pageType: "productHome") { pageSlug pageType } }
+      }
     }
   }
 }
@@ -89,6 +93,30 @@ def _clean_epic_slug(slug):
     """
     slug = (slug or '').strip().strip('/')
     return slug.split('/', 1)[0] if slug else ''
+
+
+_HEX_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+def _store_page_slug(element):
+    """
+    The slug of a game's real store page, from a searchStore element, or ''.
+
+    Newer store pages carry a short hash suffix ("luftrausers-51e5e9") that
+    neither productSlug (null) nor the catalog's urlSlug ("luftrausers", or a
+    bare 32-character id for some products) includes, so /p/{urlSlug} 404s.
+    The real slug is in the productHome page mappings. urlSlug is kept only as
+    a last resort, and never when it is an internal id.
+    """
+    mappings = list((element.get('catalogNs') or {}).get('mappings') or [])
+    mappings += list(element.get('offerMappings') or [])
+    for m in mappings:
+        if (m or {}).get('pageType') == 'productHome':
+            slug = _clean_epic_slug(m.get('pageSlug'))
+            if slug:
+                return slug
+    slug = _clean_epic_slug(element.get('productSlug') or element.get('urlSlug'))
+    return '' if _HEX_ID_RE.match(slug) else slug
 
 
 # ── Token storage ─────────────────────────────────────────────────────────────
@@ -404,6 +432,8 @@ def _do_sync_library():
                         continue
 
                     url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
+                    if _HEX_ID_RE.match(url_slug):
+                        url_slug = ''
 
                     with _sync_lock:
                         _sync_state['current_game'] = name
@@ -427,12 +457,10 @@ def _do_sync_library():
                     # Metadata from catalog entry + store/ratings API
                     meta = _extract_metadata(entry)
                     if ns not in store_cache:
-                        s = _fetch_epic_store_data(ns)
-                        s.pop('_description', None)
-                        store_cache[ns] = s
+                        store_cache[ns] = _fetch_epic_store_data(ns)
                     if ns not in ratings_cache:
                         ratings_cache[ns] = _fetch_epic_ratings(ns)
-                    meta.update(store_cache[ns])
+                    _apply_store_data(meta, store_cache[ns])
                     meta.update(ratings_cache[ns])
                     meta['meta_fetched'] = today
                     try:
@@ -518,8 +546,7 @@ def _fetch_meta_for_new_games(games):
             meta = _extract_metadata(entry)
             meta['meta_fetched'] = today
             if ns:
-                store = _fetch_epic_store_data(ns)
-                meta.update(store)
+                _apply_store_data(meta, _fetch_epic_store_data(ns))
                 meta.update(_fetch_epic_ratings(ns))
             update_game_data(appid, **meta)
             log.info(f'Epic meta: fetched for {name!r} (appid {appid})')
@@ -555,6 +582,35 @@ def _get_tag_name_cache():
     return _tag_name_cache
 
 
+def _parse_pc_release(value):
+    """Epic's pcReleaseDate (ISO string) as a unix timestamp, or None. This is
+    the date shown as "Release Date" on the store page, set by the publisher.
+    (The sibling releaseDate/creationDate fields are when the item was listed
+    in Epic's catalog.) Unreleased games carry a 2099 placeholder, so anything
+    more than a year ahead is ignored."""
+    from datetime import datetime
+    if not value:
+        return None
+    try:
+        ts = int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+    except Exception:
+        return None
+    return ts if ts <= time.time() + 365 * 86400 else None
+
+
+def _apply_store_data(meta, store, current_release=None):
+    """Merge a _fetch_epic_store_data() result into a meta dict. Drops the
+    private keys, and sets release_date to Epic's date when the game has none
+    yet or Epic's is earlier (the earliest platform is the original release;
+    a later Epic date is just when it was listed there)."""
+    store = dict(store)
+    store.pop('_description', None)
+    epic_ts = store.pop('_release_date', None)
+    meta.update(store)
+    if epic_ts and (not current_release or epic_ts < current_release):
+        meta['release_date'] = epic_ts
+
+
 def _fetch_epic_store_data(namespace):
     """Fetch store tags and product slug for a game by namespace via GraphQL.
     Returns {'tags': 'comma,separated', 'platform_slug': 'slug'} with only populated keys."""
@@ -582,16 +638,240 @@ def _fetch_epic_store_data(namespace):
             if names:
                 result['tags'] = ','.join(names)
                 log.info(f'Epic store tags for {namespace!r}: {names}')
-        slug = _clean_epic_slug(el.get('productSlug') or el.get('urlSlug'))
+        slug = _store_page_slug(el)
         if slug:
             result['platform_slug'] = slug
         desc = (el.get('description') or '').strip()
         if desc:
             result['_description'] = desc
+        ts = _parse_pc_release(el.get('pcReleaseDate'))
+        if ts:
+            result['_release_date'] = ts
         return result
     except Exception as e:
         log.warning(f'Epic store data fetch failed for {namespace!r}: {e}')
         return {}
+
+
+_REPAIR_KEY = 'epic_listing_repair'   # config.json key: store-listing repair finished (1)
+
+
+def _claim_progress(total):
+    """Claim core's shared bulk-op slot (the top-bar progress button, labelled
+    "Backfill missing metadata") for this repair. Returns (state, lock, cancel)
+    or None when the slot is busy or this core has no such slot, in which case
+    the repair just runs without a progress bar. The same slot is used by
+    core's own startup metadata backfill."""
+    try:
+        from library import _bulk_op_state, _bulk_op_lock, _bulk_op_cancel
+    except Exception:
+        return None
+    with _bulk_op_lock:
+        if _bulk_op_state['running']:
+            return None
+        _bulk_op_cancel.clear()
+        _bulk_op_state.update(running=True, op='metadata', total=total, done=0,
+                              failed=0, rate_limit_hit=False, aborted=False, result=None)
+    return _bulk_op_state, _bulk_op_lock, _bulk_op_cancel
+
+
+def _release_progress(slot, aborted=False, result=None):
+    if not slot:
+        return
+    state, lock, _cancel = slot
+    with lock:
+        state['aborted'] = aborted
+        state['result'] = result
+        state['running'] = False
+
+
+def _apply_epic_release_dates():
+    """Final repair pass, after the PCGamingWiki/Steam backfill: set each game's
+    release date to the earlier of that date and Epic's own pcReleaseDate (the
+    date on the store page). Epic's date is earlier for Epic exclusives and the
+    backfill's is earlier for re-listed older games, so the earlier one is the
+    original release; a game the backfill found nothing for gets Epic's.
+    Marks the repair finished (flag 2) only if most lookups worked."""
+    from database import get_db, update_game_data
+    db = get_db()
+    rows = db.execute(
+        "SELECT appid, name, platform_ns, release_date FROM games "
+        "WHERE platform = 'epic_games' AND platform_ns IS NOT NULL AND platform_ns != ''"
+    ).fetchall()
+    db.close()
+    by_ns = {}
+    for r in rows:
+        by_ns.setdefault(r['platform_ns'], []).append(r)
+    slot = _claim_progress(len(by_ns))
+    try:
+        ok = changed = 0
+        for ns, games in by_ns.items():
+            if slot and slot[2].is_set():
+                log.info('Epic listing repair: cancelled during the release date pass, will retry next start')
+                _release_progress(slot, aborted=True)
+                return
+            epic_ts = _fetch_epic_store_data(ns).get('_release_date')
+            if epic_ts:
+                ok += 1
+                for g in games:
+                    cur = g['release_date']
+                    if not cur or epic_ts < cur:
+                        update_game_data(g['appid'], release_date=epic_ts)
+                        changed += 1
+                        log.info(f"Epic listing repair: {g['name']!r} release date set from Epic "
+                                 f"(was {cur or 'empty'}, now {epic_ts})")
+            if slot:
+                with slot[1]:
+                    slot[0]['done'] += 1
+                    if not epic_ts:
+                        slot[0]['failed'] += 1
+            time.sleep(0.3)
+        if by_ns and ok < len(by_ns) / 2:
+            log.warning(f'Epic listing repair: only {ok}/{len(by_ns)} release date lookups worked, will retry next start')
+            _release_progress(slot, aborted=True)
+            return
+        cfg = load_config() or {}
+        cfg[_REPAIR_KEY] = 2
+        _save_config_data(cfg)
+        log.info(f'Epic listing repair: release date pass done, {changed} dates set from Epic')
+        _release_progress(slot)
+    except Exception:
+        _release_progress(slot, aborted=True)
+        raise
+
+
+def repair_listing_data():
+    """
+    One-time repair of two things older syncs stored wrongly (runs on a
+    background thread at startup, see EpicGamesPlugin.on_startup):
+
+      * platform_slug: the store link. Re-read from Epic's public store API
+        (no login needed), which knows the real page slug.
+      * release_date: Epic only knows when an item was listed in its catalog,
+        so every stored date is a listing date. They are cleared and the games
+        queued for core's metadata backfill (PCGamingWiki, then Steam), which
+        finds the real release date.
+
+    The slug/clear stage runs once (config.json flag, set only when most
+    lookups worked, so an offline start retries). The backfill stage is driven
+    purely by DB state (Epic game, no release date, backfill not yet attempted)
+    so an interrupted or cancelled run resumes on the next start. Progress
+    shows in the top-bar button (see _claim_progress). Never raises.
+    """
+    slot = None
+    try:
+        from database import get_db, update_game_data
+        cfg = load_config() or {}
+        if (cfg.get(_REPAIR_KEY) or 0) >= 2:
+            return
+        if not cfg.get(_REPAIR_KEY):
+            db = get_db()
+            rows = db.execute(
+                "SELECT appid, platform_ns, platform_slug, release_date FROM games "
+                "WHERE platform = 'epic_games' AND platform_ns IS NOT NULL AND platform_ns != ''"
+            ).fetchall()
+            db.close()
+
+            by_ns = {}
+            for r in rows:
+                by_ns.setdefault(r['platform_ns'], []).append(r)
+            slot = _claim_progress(len(by_ns))
+            ok = 0
+            slugs = {}
+            for ns in by_ns:
+                if slot and slot[2].is_set():
+                    log.info('Epic listing repair: cancelled during store lookups, will retry next start')
+                    _release_progress(slot, aborted=True)
+                    return
+                slug = _fetch_epic_store_data(ns).get('platform_slug')
+                if slug:
+                    ok += 1
+                    slugs[ns] = slug
+                if slot:
+                    with slot[1]:
+                        slot[0]['done'] += 1
+                        if not slug:
+                            slot[0]['failed'] += 1
+                time.sleep(0.3)
+            if by_ns and ok < len(by_ns) / 2:
+                log.warning(f'Epic listing repair: only {ok}/{len(by_ns)} store lookups worked, will retry next start')
+                _release_progress(slot, aborted=True)
+                return
+
+            fixed = cleared = 0
+            for ns, games in by_ns.items():
+                for g in games:
+                    fields = {}
+                    if slugs.get(ns) and slugs[ns] != g['platform_slug']:
+                        fields['platform_slug'] = slugs[ns]
+                        fixed += 1
+                    if g['release_date']:
+                        fields['release_date'] = None
+                        fields['meta_backfill_fetched'] = '0'
+                        cleared += 1
+                    if fields:
+                        update_game_data(g['appid'], **fields)
+            log.info(f'Epic listing repair: {fixed} store links fixed, {cleared} listing dates cleared')
+            cfg = load_config() or {}
+            cfg[_REPAIR_KEY] = 1
+            _save_config_data(cfg)
+            _release_progress(slot)
+            slot = None
+
+        db = get_db()
+        pending = [r['appid'] for r in db.execute(
+            "SELECT appid FROM games WHERE platform = 'epic_games' AND release_date IS NULL "
+            "AND (meta_backfill_fetched IS NULL OR meta_backfill_fetched IN ('0', 'retry')) "
+            "ORDER BY appid"
+        ).fetchall()]
+        db.close()
+        if not pending:
+            _apply_epic_release_dates()
+            return
+        slot = _claim_progress(len(pending))
+        if slot is None:
+            try:
+                from library import _bulk_op_state  # noqa: F401
+                log.info('Epic listing repair: another bulk operation is running, backfill will resume next start')
+                return
+            except Exception:
+                pass   # core without the shared slot: run with no progress bar
+
+        def _cb(event, _data, _total):
+            if not slot:
+                return
+            with slot[1]:
+                if event == 'done':
+                    slot[0]['done'] += 1
+                elif event == 'failed':
+                    slot[0]['failed'] += 1
+                elif event == 'rate_limit':
+                    slot[0]['rate_limit_hit'] = True
+
+        from scrapers import _backfill_batch
+        log.info(f'Epic listing repair: backfilling release dates for {len(pending)} games')
+        result = _backfill_batch(pending, slot[2] if slot else None, _cb,
+                                 inter_delay=3.0, rerun=True)
+        _release_progress(slot, aborted=result.get('aborted', False), result=result)
+        slot = None
+        log.info(f'Epic listing repair: backfill finished {result}')
+        # Only once nothing is left to backfill: a Stop click ends the batch
+        # early without marking it aborted, and the date pass must not run on
+        # a half-done backfill (it would not break anything, but the flag
+        # would then say the repair is finished when it is not).
+        db = get_db()
+        left = db.execute(
+            "SELECT COUNT(*) FROM games WHERE platform = 'epic_games' AND release_date IS NULL "
+            "AND (meta_backfill_fetched IS NULL OR meta_backfill_fetched IN ('0', 'retry'))"
+        ).fetchone()[0]
+        db.close()
+        if left:
+            log.info(f'Epic listing repair: {left} games still to backfill, will resume next start')
+        else:
+            _apply_epic_release_dates()
+    except Exception as e:
+        _release_progress(slot, aborted=True)
+        log.warning(f'Epic listing repair failed: {e}')
 
 
 def fetch_description(appid, platform_id):
@@ -649,7 +929,6 @@ def _extract_metadata(entry):
     Pull the useful fields from a catalog entry dict.
     Returns a meta dict ready for update_game_data (without meta_fetched).
     """
-    from datetime import datetime
     meta = {}
 
     # customAttributes holds developerName/publisherName/genres as typed values;
@@ -672,23 +951,14 @@ def _extract_metadata(entry):
         meta['genres'] = genres_str
 
     url_slug = _clean_epic_slug(entry.get('urlSlug', ''))
-    if url_slug:
+    if url_slug and not _HEX_ID_RE.match(url_slug):
         meta['platform_slug'] = url_slug
 
-
-    # Use first releaseInfo dateAdded; fall back to creationDate
-    release_date_str = ''
-    release_info = entry.get('releaseInfo', [])
-    if release_info and release_info[0].get('dateAdded'):
-        release_date_str = release_info[0]['dateAdded']
-    if not release_date_str:
-        release_date_str = entry.get('creationDate', '')
-    if release_date_str:
-        try:
-            dt = datetime.fromisoformat(release_date_str.replace('Z', '+00:00'))
-            meta['release_date'] = int(dt.timestamp())
-        except Exception:
-            pass
+    # No release_date on purpose. Epic's releaseInfo.dateAdded / creationDate
+    # (and the store API's releaseDate) are when the item was listed in Epic's
+    # catalog, not when the game came out: a free giveaway of a 2014 game
+    # reads as the day the giveaway went up. Leaving it empty lets core's
+    # metadata backfill (PCGamingWiki, then the Steam page) fill the real date.
 
     return meta
 
@@ -839,7 +1109,7 @@ def scrape_single(appid):
     from database import get_db
     db  = get_db()
     row = db.execute(
-        "SELECT platform_id, platform_slug, platform_ns FROM games WHERE appid = ? AND platform = 'epic_games'",
+        "SELECT platform_id, platform_slug, platform_ns, release_date FROM games WHERE appid = ? AND platform = 'epic_games'",
         (appid,)
     ).fetchone()
     db.close()
@@ -855,9 +1125,7 @@ def scrape_single(appid):
     today = date.today().isoformat()
     meta  = _extract_metadata(entry)
     meta['meta_fetched'] = today
-    store = _fetch_epic_store_data(ns)
-    store.pop('_description', None)
-    meta.update(store)
+    _apply_store_data(meta, _fetch_epic_store_data(ns), row['release_date'])
     meta.update(_fetch_epic_ratings(ns))
 
     # Re-fetch art if files are missing
@@ -1039,11 +1307,11 @@ def _sync_metadata(force=False):
     try:
         if force:
             rows = db.execute(
-                "SELECT appid, platform_id, platform_ns, name FROM games WHERE platform = 'epic_games'"
+                "SELECT appid, platform_id, platform_ns, name, release_date FROM games WHERE platform = 'epic_games'"
             ).fetchall()
         else:
             rows = db.execute(
-                "SELECT appid, platform_id, platform_ns, name FROM games "
+                "SELECT appid, platform_id, platform_ns, name, release_date FROM games "
                 "WHERE platform = 'epic_games' AND (meta_fetched IS NULL OR meta_fetched = '0')"
             ).fetchall()
 
@@ -1078,9 +1346,7 @@ def _sync_metadata(force=False):
             else:
                 meta = _extract_metadata(entry)
                 meta['meta_fetched'] = today
-                store = _fetch_epic_store_data(platform_ns)
-                store.pop('_description', None)
-                meta.update(store)
+                _apply_store_data(meta, _fetch_epic_store_data(platform_ns), row['release_date'])
                 meta.update(_fetch_epic_ratings(platform_ns))
 
                 try:
