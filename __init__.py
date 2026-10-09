@@ -175,6 +175,8 @@ class EpicGamesPlugin:
             time.sleep(60)   # let the app settle; this makes a lot of slow web requests
             from .epic import repair_listing_data
             repair_listing_data()
+            from .epic import fill_missing_release_dates
+            fill_missing_release_dates()
         threading.Thread(target=_repair, daemon=True, name='epic-listing-repair').start()
         from .watcher import (start_epic_watcher, start_periodic_sync,
                                sync_epic_install_status, _get_install_base)

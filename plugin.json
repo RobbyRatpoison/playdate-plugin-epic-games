@@ -1,11 +1,11 @@
 {
   "id": "epic_games",
   "name": "Epic Games",
-  "version": "2026.10.1",
+  "version": "2026.10.2",
   "min_core_version": "1.8.2",
   "release_note": {
-    "version": "2026.10.1",
-    "text": "Fix store links and release dates for newer games: links now use the real store page, and release dates come from Epic's own Release Date instead of the day the game was listed. A one-time background repair fixes existing games after updating."
+    "version": "2026.10.2",
+    "text": "Fix missing release dates and store data for games whose store page lists several editions or another game's offers: the base game's own offer is now used, and the store page's date fills in when no other source has one."
   },
   "platform": "epic_games",
   "author": "RobbyRatpoison",

@@ -55,7 +55,23 @@ query searchStoreQuery($namespace: String, $country: String!, $locale: String) {
   Catalog {
     searchStore(namespace: $namespace, country: $country, locale: $locale) {
       elements {
-        productSlug urlSlug description tags { id } pcReleaseDate
+        title namespace offerType productSlug urlSlug description tags { id }
+        pcReleaseDate releaseDate
+        offerMappings { pageSlug pageType }
+        catalogNs { mappings(pageType: "productHome") { pageSlug pageType } }
+      }
+    }
+  }
+}
+"""
+
+_KEYWORD_STORE_QUERY = """
+query keywordStoreQuery($keywords: String!, $country: String!, $locale: String) {
+  Catalog {
+    searchStore(keywords: $keywords, country: $country, locale: $locale, count: 20) {
+      elements {
+        title namespace offerType productSlug urlSlug description tags { id }
+        pcReleaseDate releaseDate
         offerMappings { pageSlug pageType }
         catalogNs { mappings(pageType: "productHome") { pageSlug pageType } }
       }
@@ -456,11 +472,11 @@ def _do_sync_library():
 
                     # Metadata from catalog entry + store/ratings API
                     meta = _extract_metadata(entry)
-                    if ns not in store_cache:
-                        store_cache[ns] = _fetch_epic_store_data(ns)
+                    if (ns, name) not in store_cache:
+                        store_cache[(ns, name)] = _fetch_epic_store_data(ns, name)
                     if ns not in ratings_cache:
                         ratings_cache[ns] = _fetch_epic_ratings(ns)
-                    _apply_store_data(meta, store_cache[ns])
+                    _apply_store_data(meta, store_cache[(ns, name)])
                     meta.update(ratings_cache[ns])
                     meta['meta_fetched'] = today
                     try:
@@ -546,7 +562,7 @@ def _fetch_meta_for_new_games(games):
             meta = _extract_metadata(entry)
             meta['meta_fetched'] = today
             if ns:
-                _apply_store_data(meta, _fetch_epic_store_data(ns))
+                _apply_store_data(meta, _fetch_epic_store_data(ns, name))
                 meta.update(_fetch_epic_ratings(ns))
             update_game_data(appid, **meta)
             log.info(f'Epic meta: fetched for {name!r} (appid {appid})')
@@ -606,30 +622,75 @@ def _apply_store_data(meta, store, current_release=None):
     store = dict(store)
     store.pop('_description', None)
     epic_ts = store.pop('_release_date', None)
+    store.pop('_listing_date', None)
     meta.update(store)
     if epic_ts and (not current_release or epic_ts < current_release):
         meta['release_date'] = epic_ts
 
 
-def _fetch_epic_store_data(namespace):
-    """Fetch store tags and product slug for a game by namespace via GraphQL.
-    Returns {'tags': 'comma,separated', 'platform_slug': 'slug'} with only populated keys."""
+def _title_key(text):
+    return re.sub(r'[^a-z0-9]+', '', (text or '').lower())
+
+
+def _title_matches(name, title):
+    """Whether an offer's title is the game called `name`. Epic's store titles
+    often carry a subtitle the library name lacks ("Halcyon 6" vs "Halcyon 6
+    Starbase Commander"), so one containing the other counts; a different game
+    that shares a namespace ("Shadowrun Returns" for "Shadowrun: Dragonfall")
+    does not."""
+    a, b = _title_key(name), _title_key(title)
+    return bool(a and b and (a in b or b in a))
+
+
+def _pick_store_element(elements, namespace, name=None):
+    """The searchStore element for the game itself. A namespace holds several
+    offers (editions, bundles, DLC, soundtracks, dev placeholders) in no useful
+    order, and only the base game's offer has the date and slug of its store
+    page. With a name, the base-game offer must also be titled like it; without
+    one, the first base-game offer (else the first element) is used."""
+    base = [e for e in elements if e.get('offerType') == 'BASE_GAME'
+            and e.get('namespace') in (None, namespace)]
+    if name is None:
+        return base[0] if base else (elements[0] if elements else None)
+    for e in base:
+        if _title_matches(name, e.get('title')):
+            return e
+    return None
+
+
+def _store_elements(query, variables):
+    resp = requests.post(
+        _STORE_GRAPHQL_URL, headers=_STORE_GQL_HEADERS,
+        json={'query': query, 'variables': dict(variables, country='US', locale='en-US')},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        log.warning(f'Epic store data HTTP {resp.status_code} for {variables!r}')
+        return []
+    return ((resp.json().get('data') or {})
+            .get('Catalog', {}).get('searchStore', {}).get('elements') or [])
+
+
+def _fetch_epic_store_data(namespace, name=None):
+    """Fetch store tags, product slug, description and dates for a game by
+    namespace via GraphQL. Returns only populated keys: 'tags', 'platform_slug',
+    '_description', '_release_date' (the publisher's pcReleaseDate) and
+    '_listing_date' (releaseDate, which is what the store page shows when the
+    publisher set no pcReleaseDate, but also just the day it was listed).
+
+    Pass the game's name so the right offer is used: a namespace can return
+    another game's offers, in which case the name is searched for and the hit
+    must be in the same namespace. If no offer fits (a delisted game), the
+    result is {} rather than another offer's data."""
     try:
-        resp = requests.post(
-            _STORE_GRAPHQL_URL,
-            headers=_STORE_GQL_HEADERS,
-            json={'query': _SEARCH_STORE_QUERY,
-                  'variables': {'namespace': namespace, 'country': 'US', 'locale': 'en-US'}},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.warning(f'Epic store data HTTP {resp.status_code} for {namespace!r}')
+        el = _pick_store_element(_store_elements(_SEARCH_STORE_QUERY, {'namespace': namespace}),
+                                 namespace, name)
+        if el is None and name:
+            hits = _store_elements(_KEYWORD_STORE_QUERY, {'keywords': name})
+            el = _pick_store_element([h for h in hits if h.get('namespace') == namespace],
+                                     namespace, name)
+        if el is None:
             return {}
-        elements = ((resp.json().get('data') or {})
-                    .get('Catalog', {}).get('searchStore', {}).get('elements', []))
-        if not elements:
-            return {}
-        el = elements[0]
         result = {}
         tag_ids = [t['id'] for t in (el.get('tags') or []) if t.get('id')]
         if tag_ids:
@@ -647,6 +708,9 @@ def _fetch_epic_store_data(namespace):
         ts = _parse_pc_release(el.get('pcReleaseDate'))
         if ts:
             result['_release_date'] = ts
+        listed = _parse_pc_release(el.get('releaseDate'))
+        if listed:
+            result['_listing_date'] = listed
         return result
     except Exception as e:
         log.warning(f'Epic store data fetch failed for {namespace!r}: {e}')
@@ -710,20 +774,23 @@ def _apply_epic_release_dates():
                 log.info('Epic listing repair: cancelled during the release date pass, will retry next start')
                 _release_progress(slot, aborted=True)
                 return
-            epic_ts = _fetch_epic_store_data(ns).get('_release_date')
-            if epic_ts:
-                ok += 1
-                for g in games:
-                    cur = g['release_date']
-                    if not cur or epic_ts < cur:
-                        update_game_data(g['appid'], release_date=epic_ts)
-                        changed += 1
-                        log.info(f"Epic listing repair: {g['name']!r} release date set from Epic "
-                                 f"(was {cur or 'empty'}, now {epic_ts})")
+            found = False
+            for g in games:
+                epic_ts = _fetch_epic_store_data(ns, g['name']).get('_release_date')
+                if not epic_ts:
+                    continue
+                found = True
+                cur = g['release_date']
+                if not cur or epic_ts < cur:
+                    update_game_data(g['appid'], release_date=epic_ts)
+                    changed += 1
+                    log.info(f"Epic listing repair: {g['name']!r} release date set from Epic "
+                             f"(was {cur or 'empty'}, now {epic_ts})")
+            ok += found
             if slot:
                 with slot[1]:
                     slot[0]['done'] += 1
-                    if not epic_ts:
+                    if not found:
                         slot[0]['failed'] += 1
             time.sleep(0.3)
         if by_ns and ok < len(by_ns) / 2:
@@ -738,6 +805,39 @@ def _apply_epic_release_dates():
     except Exception:
         _release_progress(slot, aborted=True)
         raise
+
+
+def fill_missing_release_dates():
+    """Last resort for an Epic game still without a release date after core's
+    PCGamingWiki/Steam backfill came up empty: use the date Epic's own store
+    page shows. Many base games carry only releaseDate there (no pcReleaseDate),
+    which is when Epic listed the game, but it is the only date there is.
+    Never touches a game with a date, nor one core has not finished (or has only
+    guessed at: 'unconfirmed'), so a real date from the wiki or Steam always wins.
+    Runs on every start; with nothing to do it makes no requests. Never raises."""
+    try:
+        from database import get_db, update_game_data
+        db = get_db()
+        rows = db.execute(
+            "SELECT appid, name, platform_ns FROM games WHERE platform = 'epic_games' "
+            "AND (release_date IS NULL OR release_date = 0) "
+            "AND platform_ns IS NOT NULL AND platform_ns != '' "
+            "AND (meta_backfill_fetched = 'no_match' OR meta_backfill_fetched GLOB '[0-9][0-9][0-9][0-9]-*')"
+        ).fetchall()
+        db.close()
+        filled = 0
+        for r in rows:
+            data = _fetch_epic_store_data(r['platform_ns'], r['name'])
+            ts = data.get('_release_date') or data.get('_listing_date')
+            if ts:
+                update_game_data(r['appid'], release_date=ts)
+                filled += 1
+                log.info(f"Epic release dates: {r['name']!r} set from Epic's store page ({ts})")
+            time.sleep(0.3)
+        if rows:
+            log.info(f'Epic release dates: {filled} of {len(rows)} games without a date filled from the store page')
+    except Exception as e:
+        log.warning(f'Epic release date fill failed: {e}')
 
 
 def repair_listing_data():
@@ -767,7 +867,7 @@ def repair_listing_data():
         if not cfg.get(_REPAIR_KEY):
             db = get_db()
             rows = db.execute(
-                "SELECT appid, platform_ns, platform_slug, release_date FROM games "
+                "SELECT appid, name, platform_ns, platform_slug, release_date FROM games "
                 "WHERE platform = 'epic_games' AND platform_ns IS NOT NULL AND platform_ns != ''"
             ).fetchall()
             db.close()
@@ -783,7 +883,7 @@ def repair_listing_data():
                     log.info('Epic listing repair: cancelled during store lookups, will retry next start')
                     _release_progress(slot, aborted=True)
                     return
-                slug = _fetch_epic_store_data(ns).get('platform_slug')
+                slug = _fetch_epic_store_data(ns, by_ns[ns][0]['name']).get('platform_slug')
                 if slug:
                     ok += 1
                     slugs[ns] = slug
@@ -879,13 +979,13 @@ def fetch_description(appid, platform_id):
     from database import get_db
     db  = get_db()
     row = db.execute(
-        "SELECT platform_ns FROM games WHERE appid = ? AND platform = 'epic_games'",
+        "SELECT platform_ns, name FROM games WHERE appid = ? AND platform = 'epic_games'",
         (appid,)
     ).fetchone()
     db.close()
     if not row or not row['platform_ns']:
         return None
-    data = _fetch_epic_store_data(row['platform_ns'])
+    data = _fetch_epic_store_data(row['platform_ns'], row['name'])
     return data.get('_description') or None
 
 
@@ -1109,7 +1209,7 @@ def scrape_single(appid):
     from database import get_db
     db  = get_db()
     row = db.execute(
-        "SELECT platform_id, platform_slug, platform_ns, release_date FROM games WHERE appid = ? AND platform = 'epic_games'",
+        "SELECT platform_id, platform_slug, platform_ns, release_date, name FROM games WHERE appid = ? AND platform = 'epic_games'",
         (appid,)
     ).fetchone()
     db.close()
@@ -1125,7 +1225,7 @@ def scrape_single(appid):
     today = date.today().isoformat()
     meta  = _extract_metadata(entry)
     meta['meta_fetched'] = today
-    _apply_store_data(meta, _fetch_epic_store_data(ns), row['release_date'])
+    _apply_store_data(meta, _fetch_epic_store_data(ns, row['name']), row['release_date'])
     meta.update(_fetch_epic_ratings(ns))
 
     # Re-fetch art if files are missing
@@ -1346,7 +1446,7 @@ def _sync_metadata(force=False):
             else:
                 meta = _extract_metadata(entry)
                 meta['meta_fetched'] = today
-                _apply_store_data(meta, _fetch_epic_store_data(platform_ns), row['release_date'])
+                _apply_store_data(meta, _fetch_epic_store_data(platform_ns, row['name']), row['release_date'])
                 meta.update(_fetch_epic_ratings(platform_ns))
 
                 try:
