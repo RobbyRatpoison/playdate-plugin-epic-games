@@ -515,6 +515,11 @@ def _do_sync_library():
     except Exception as e:
         log.warning(f'Epic sync: install status refresh failed: {e}')
 
+    try:
+        _disambiguate_same_names()
+    except Exception as e:
+        log.warning(f'Epic sync: name disambiguation failed: {e}')
+
     from database import auto_detect_duplicates
     from plugins import get_platform_priority
     dupes = auto_detect_duplicates(platform_priority=get_platform_priority())
@@ -630,6 +635,49 @@ def _apply_store_data(meta, store, current_release=None):
 
 def _title_key(text):
     return re.sub(r'[^a-z0-9]+', '', (text or '').lower())
+
+
+def _disambiguate_same_names():
+    """Epic can list two different products under one catalog title: the base game and a standalone
+    expansion ("Shadow Tactics Blades of the Shogun" for both the game and Aiko's Choice), which
+    leaves two library rows that look identical. For rows whose names collide, and only those, use
+    the title of the product's own store page when it differs ("Shadow Tactics - Aiko's Choice").
+    Names that don't collide are never touched, so a rename made by hand sticks. Returns how many
+    rows were renamed."""
+    from database import get_db, update_game_data as _update_game_data
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT appid, name, platform_ns FROM games WHERE platform = 'epic_games' "
+            "AND name IS NOT NULL AND platform_ns IS NOT NULL AND platform_ns != ''"
+        ).fetchall()
+    finally:
+        db.close()
+    groups = {}
+    for r in rows:
+        groups.setdefault(_title_key(r['name']), []).append(r)
+    renamed = 0
+    taken = set(groups)
+    for key, group in groups.items():
+        if not key or len(group) < 2 or len({r['platform_ns'] for r in group}) < 2:
+            continue   # one product listed twice (entitlement + installable) is not this case
+        for r in group:
+            try:
+                el = _pick_store_element(_store_elements(_SEARCH_STORE_QUERY, {'namespace': r['platform_ns']}),
+                                         r['platform_ns'])
+            except Exception as e:
+                log.warning(f"Epic names: store lookup failed for {r['name']!r}: {e}")
+                continue
+            title = ((el or {}).get('title') or '').strip()
+            tkey = _title_key(title)
+            if not tkey or tkey == key or tkey in taken:
+                continue
+            # Same bookkeeping as a rename by hand: the old Steam match belonged to the old name
+            _update_game_data(r['appid'], name=title, meta_backfill_fetched='0', steam_appid=None)
+            taken.add(tkey)
+            renamed += 1
+            log.info(f"Epic names: {r['name']!r} shares its name with another Epic game, renamed {title!r}")
+    return renamed
 
 
 def _title_matches(name, title):
