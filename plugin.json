@@ -1,11 +1,11 @@
 {
   "id": "epic_games",
   "name": "Epic Games",
-  "version": "2026.10.3",
-  "min_core_version": "1.8.2",
+  "version": "2026.10.4",
+  "min_core_version": "2026.10.5",
   "release_note": {
-    "version": "2026.10.3",
-    "text": "Tell apart two Epic games that Epic lists under the same title."
+    "version": "2026.10.4",
+    "text": "Sync Epic Data in the edit window also fetches the purchase date."
   },
   "platform": "epic_games",
   "author": "RobbyRatpoison",

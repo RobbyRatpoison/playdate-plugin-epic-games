@@ -112,7 +112,19 @@ def epic_scrape_single(appid):
 
     update_game_data(appid, **meta)
 
+    # The purchase date too (an explicit sync of this one game, so overwriting is expected).
+    try:
+        from .epic import fetch_purchase_dates_for_appids
+        ts = fetch_purchase_dates_for_appids([appid]).get(appid)
+        if ts:
+            update_game_data(appid, date_added=ts)
+            meta['date_added'] = ts
+    except Exception as e:
+        log.warning(f'Epic scrape-single: purchase date for {appid} failed: {e}')
+
     data_out = dict(meta)
+    if data_out.get('date_added'):
+        data_out['date_added'] = ts_to_date(data_out['date_added']) or ''
     if data_out.get('release_date'):
         data_out['release_date'] = ts_to_date(data_out['release_date']) or ''
     return jsonify({'status': 'success', 'data': data_out})
