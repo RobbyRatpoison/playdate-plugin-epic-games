@@ -1,32 +1,32 @@
 {
-  "id": "epic_games",
-  "name": "Epic Games",
-  "version": "2026.10.4",
-  "min_core_version": "2026.10.5",
-  "release_note": {
-    "version": "2026.10.4",
-    "text": "Sync Epic Data in the edit window also fetches the purchase date."
-  },
-  "platform": "epic_games",
-  "author": "RobbyRatpoison",
-  "source": "github:RobbyRatpoison/playdate-plugin-epic-games",
-  "launcher": {
-    "required": true,
-    "name": "Epic Games Launcher",
-    "exe_name": "EpicGamesLauncher.exe",
-    "installer": {
-      "url": "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi",
-      "type": "msi",
-      "winearch": "win64",
-      "post_install_dlls": [
-        "lib/vkd3d/x86_64-windows/libvkd3d-1.dll",
-        "lib/vkd3d/x86_64-windows/libvkd3d-shader-1.dll"
-      ]
+    "id": "epic_games",
+    "name": "Epic Games",
+    "version": "2026.10.5",
+    "release_note": {
+        "version": "2026.10.5",
+        "text": "New option on the plugin's card: sync your library when PlayDate starts."
+    },
+    "min_core_version": "2026.10.5",
+    "platform": "epic_games",
+    "author": "RobbyRatpoison",
+    "source": "github:RobbyRatpoison/playdate-plugin-epic-games",
+    "launcher": {
+        "required": true,
+        "name": "Epic Games Launcher",
+        "exe_name": "EpicGamesLauncher.exe",
+        "installer": {
+            "url": "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi",
+            "type": "msi",
+            "winearch": "win64",
+            "post_install_dlls": [
+                "lib/vkd3d/x86_64-windows/libvkd3d-1.dll",
+                "lib/vkd3d/x86_64-windows/libvkd3d-shader-1.dll"
+            ]
+        }
+    },
+    "platform_status": {
+        "windows": "untested",
+        "linux": "working",
+        "mac": "untested"
     }
-  },
-  "platform_status": {
-    "windows": "untested",
-    "linux": "working",
-    "mac": "untested"
-  }
 }
